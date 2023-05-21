@@ -1,0 +1,14 @@
+{
+    "gopls": {
+        "usePlaceholders": true, // add parameter placeholders when completing a function
+        "completeUnimported": true, // autocomplete unimported packages
+        "deepCompletion": true, // enable deep completion
+        "ui.semanticTokens": true, // syntax highlighting
+        // "experimentalWorkspaceModule": true,
+        // "build.experimentalWorkspaceModule": true,
+        "ui.completion.experimentalPostfixCompletions":true,
+        "buildFlags": [
+            "-tags=linux amd64"
+        ],
+    },
+}
