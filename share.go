@@ -1,4 +1,4 @@
-package main
+package sharesnapshot
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/containerd/continuity/fs"
-	"go.etcd.io/etcd/clientv3"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -31,10 +31,10 @@ var defaultMountOptions = []string{"rbind"}
 
 type Snapshotter struct {
 	root   string
-	client *clientv3.Client
+	client *redis.Client
 }
 
-func NewSnapshotter(root string, etcdClient *clientv3.Client) (snapshots.Snapshotter, error) {
+func NewSnapshotter(root string, redisClient *redis.Client) (snapshots.Snapshotter, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
@@ -45,7 +45,7 @@ func NewSnapshotter(root string, etcdClient *clientv3.Client) (snapshots.Snapsho
 
 	return &Snapshotter{
 		root:   root,
-		client: etcdClient,
+		client: redisClient,
 	}, nil
 }
 
@@ -54,20 +54,12 @@ func (o *Snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, err
 }
 
 func (o *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (newInfo snapshots.Info, err error) {
-	data, err := json.Marshal(info)
+	result, err := o.client.Set(ctx, info.Name, info, 0).Result()
 	if err != nil {
 		return snapshots.Info{}, err
 	}
 
-	resp, err := o.client.Put(ctx, info.Name, string(data))
-	if err != nil {
-		return snapshots.Info{}, err
-	}
-
-	if err := json.Unmarshal(resp.PrevKv.Value, &newInfo); err != nil {
-		return snapshots.Info{}, err
-	}
-
+	err = json.Unmarshal([]byte(result), &newInfo)
 	return newInfo, err
 }
 
@@ -165,17 +157,13 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 	)
 
 	err = func() error {
-		resp, err := o.client.Delete(ctx, key)
+		result, err := o.client.GetDel(ctx, key).Result()
 		if err != nil {
 			return err
 		}
 
-		if resp.Deleted != 1 {
-			return errors.New("count != 1")
-		}
-
 		var info snapshots.Info
-		if err := json.Unmarshal(resp.PrevKvs[0].Value, &info); err != nil {
+		if err := json.Unmarshal([]byte(result), &info); err != nil {
 			return err
 		}
 
@@ -221,14 +209,14 @@ func (o *Snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...str
 		return err
 	}
 
-	resp, err := o.client.Get(ctx, "/")
+	results, err := o.client.Keys(ctx, "*").Result()
 	if err != nil {
 		return err
 	}
 
-	for _, v := range resp.Kvs {
+	for i := range results {
 		var info snapshots.Info
-		if err := json.Unmarshal(v.Value, &info); err != nil {
+		if err := json.Unmarshal([]byte(results[i]), &info); err != nil {
 			return err
 		}
 
@@ -311,7 +299,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}
 
-	countResp, err := o.client.Get(ctx, "/", clientv3.WithPrefix(), clientv3.WithCountOnly())
+	count, err := o.client.DBSize(ctx).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +311,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	// Id is key plus the number of current folders
-	id := strconv.Itoa(int(countResp.Count) + len(des))
+	id := strconv.Itoa(int(count) + len(des))
 	base.Labels[SnapID] = id
 	si := snapshots.Info{
 		Parent:  parent,
@@ -333,12 +321,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		Updated: t,
 	}
 
-	data, err := json.Marshal(si)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := o.client.Put(ctx, key, string(data)); err != nil {
+	if err := o.client.Set(ctx, key, si, 0).Err(); err != nil {
 		return nil, err
 	}
 
@@ -399,22 +382,9 @@ func (o *Snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 	}
 }
 
-func (o *Snapshotter) getInfo(ctx context.Context, key string) (snapshots.Info, error) {
-	var info snapshots.Info
-
-	resp, err := o.client.Get(ctx, key)
-	if err != nil {
-		return snapshots.Info{}, err
-	}
-
-	if resp.Count != 1 {
-		return snapshots.Info{}, errors.New("count != 1")
-	}
-
-	if err := json.Unmarshal(resp.Kvs[0].Value, &info); err != nil {
-		return snapshots.Info{}, err
-	}
-	return info, nil
+func (o *Snapshotter) getInfo(ctx context.Context, key string) (info snapshots.Info, err error) {
+	err = o.client.Get(ctx, key).Scan(info)
+	return
 }
 
 func adaptSnapshot(info snapshots.Info) filters.Adaptor {
