@@ -1,53 +1,65 @@
 package main
 
 import (
-	"errors"
+	"fmt"
+	"net"
 	"os"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/plugin"
+	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
+	"github.com/containerd/containerd/contrib/snapshotservice"
 	"go.etcd.io/etcd/clientv3"
+	"google.golang.org/grpc"
 )
 
-var EtcdClient *clientv3.Client
+// args - listenPath root etcdAddr
+func main() {
+	// Provide a unix address to listen to, this will be the `address`
+	// in the `proxy_plugin` configuration.
+	// The root will be used to store the snapshots.
+	if len(os.Args) < 4 {
+		fmt.Printf("invalid args: usage: %s <unix addr> <root>\n", os.Args[0])
+		os.Exit(1)
+	}
 
-func Init() {
-	var err error
-	EtcdClient, err = clientv3.New(clientv3.Config{
-		Endpoints:   []string{os.Getenv("ETCD_ADDR")},
+	// Create a gRPC server
+	rpc := grpc.NewServer()
+
+	// Configure your custom snapshotter, this example uses the native
+	// snapshotter and a root directory. Your custom snapshotter will be
+	// much more useful than using a snapshotter which is already included.
+	// https://godoc.org/github.com/containerd/containerd/snapshots#Snapshotter
+
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{os.Args[3]},
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
-		panic(err)
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
 	}
-}
 
-// Config represents configuration for the native plugin.
-type Config struct {
-	// Root directory for the plugin
-	RootPath string `toml:"root_path"`
-}
+	sn, err := NewSnapshotter(os.Args[2], etcdClient)
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
+	}
 
-func main() {
-	plugin.Register(&plugin.Registration{
-		Type:   plugin.SnapshotPlugin,
-		ID:     "share",
-		Config: &Config{},
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
-			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
+	// Convert the snapshotter to a gRPC service,
+	// example in github.com/containerd/containerd/contrib/snapshotservice
+	service := snapshotservice.FromSnapshotter(sn)
 
-			config, ok := ic.Config.(*Config)
-			if !ok {
-				return nil, errors.New("invalid share configuration")
-			}
+	// Register the service with the gRPC server
+	snapshotsapi.RegisterSnapshotsServer(rpc, service)
 
-			root := ic.Root
-			if len(config.RootPath) != 0 {
-				root = config.RootPath
-			}
-
-			return NewSnapshotter(root)
-		},
-	})
+	// Listen and serve
+	l, err := net.Listen("unix", os.Args[1])
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
+	}
+	if err := rpc.Serve(l); err != nil {
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
+	}
 }

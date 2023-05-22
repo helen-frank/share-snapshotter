@@ -30,10 +30,11 @@ const (
 var defaultMountOptions = []string{"rbind"}
 
 type Snapshotter struct {
-	root string
+	root   string
+	client *clientv3.Client
 }
 
-func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
+func NewSnapshotter(root string, etcdClient *clientv3.Client) (snapshots.Snapshotter, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
@@ -43,12 +44,13 @@ func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
 	}
 
 	return &Snapshotter{
-		root: root,
+		root:   root,
+		client: etcdClient,
 	}, nil
 }
 
 func (o *Snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
-	return getInfo(ctx, key)
+	return o.getInfo(ctx, key)
 }
 
 func (o *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (newInfo snapshots.Info, err error) {
@@ -57,7 +59,7 @@ func (o *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 		return snapshots.Info{}, err
 	}
 
-	resp, err := EtcdClient.Put(ctx, info.Name, string(data))
+	resp, err := o.client.Put(ctx, info.Name, string(data))
 	if err != nil {
 		return snapshots.Info{}, err
 	}
@@ -70,7 +72,7 @@ func (o *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 }
 
 func (o *Snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Usage, err error) {
-	info, err := getInfo(ctx, key)
+	info, err := o.getInfo(ctx, key)
 	if err != nil {
 		return snapshots.Usage{}, err
 	}
@@ -108,7 +110,7 @@ func (o *Snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 }
 
 func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
-	info, err := getInfo(ctx, key)
+	info, err := o.getInfo(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +119,7 @@ func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 		return nil, errors.New(SnapID + " not found")
 	}
 
-	parentInfo, err := getInfo(ctx, info.Parent)
+	parentInfo, err := o.getInfo(ctx, info.Parent)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +137,7 @@ func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 
 // Commit commits the given snapshot to the backend.
 func (o *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
-	info, err := getInfo(ctx, key)
+	info, err := o.getInfo(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -163,7 +165,7 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 	)
 
 	err = func() error {
-		resp, err := EtcdClient.Delete(ctx, key)
+		resp, err := o.client.Delete(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -219,7 +221,7 @@ func (o *Snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...str
 		return err
 	}
 
-	resp, err := EtcdClient.Get(ctx, "/")
+	resp, err := o.client.Get(ctx, "/")
 	if err != nil {
 		return err
 	}
@@ -293,7 +295,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 	var parentID string
 	if parent != "" {
-		parentInfo, err := getInfo(ctx, parent)
+		parentInfo, err := o.getInfo(ctx, parent)
 		if err != nil {
 			return nil, err
 		}
@@ -309,13 +311,19 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}
 
-	countResp, err := EtcdClient.Get(ctx, "/", clientv3.WithPrefix(), clientv3.WithCountOnly())
+	countResp, err := o.client.Get(ctx, "/", clientv3.WithPrefix(), clientv3.WithCountOnly())
 	if err != nil {
 		return nil, err
 	}
 	t := time.Now().UTC()
 
-	id := strconv.Itoa(int(countResp.Count))
+	des, err := os.ReadDir(filepath.Join(o.root, "snapshots"))
+	if err != nil {
+		return nil, err
+	}
+
+	// Id is key plus the number of current folders
+	id := strconv.Itoa(int(countResp.Count) + len(des))
 	base.Labels[SnapID] = id
 	si := snapshots.Info{
 		Parent:  parent,
@@ -330,8 +338,31 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
-	if _, err := EtcdClient.Put(ctx, key, string(data)); err != nil {
+	if _, err := o.client.Put(ctx, key, string(data)); err != nil {
 		return nil, err
+	}
+
+	if parentID != "" {
+		xattrErrorHandler := func(dst, src, xattrKey string, copyErr error) error {
+			// security.* xattr cannot be copied in most cases (moby/buildkit#1189)
+			log.G(ctx).WithError(copyErr).Debugf("failed to copy xattr %q", xattrKey)
+			return nil
+		}
+
+		copyDirOpts := []fs.CopyDirOpt{
+			fs.WithXAttrErrorHandler(xattrErrorHandler),
+		}
+
+		parentPath := o.getSnapshotDir(parentID)
+		if err = fs.CopyDir(td, parentPath, copyDirOpts...); err != nil {
+			return nil, fmt.Errorf("copying of parent failed: %w", err)
+		}
+
+		path = o.getSnapshotDir(id)
+		if err = os.Rename(td, path); err != nil {
+			return nil, fmt.Errorf("failed to rename: %w", err)
+		}
+		td = ""
 	}
 
 	return o.mounts(storage.Snapshot{
@@ -368,18 +399,10 @@ func (o *Snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 	}
 }
 
-// supportsIndex checks whether the "index=off" option is supported by the kernel.
-func supportsIndex() bool {
-	if _, err := os.Stat("/sys/module/overlay/parameters/index"); err == nil {
-		return true
-	}
-	return false
-}
-
-func getInfo(ctx context.Context, key string) (snapshots.Info, error) {
+func (o *Snapshotter) getInfo(ctx context.Context, key string) (snapshots.Info, error) {
 	var info snapshots.Info
 
-	resp, err := EtcdClient.Get(ctx, key)
+	resp, err := o.client.Get(ctx, key)
 	if err != nil {
 		return snapshots.Info{}, err
 	}
