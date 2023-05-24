@@ -61,6 +61,7 @@ func main() {
 		fmt.Printf("error: %v\n", err)
 		os.Exit(1)
 	}
+	
 	if err := rpc.Serve(l); err != nil {
 		fmt.Printf("error: %v\n", err)
 		os.Exit(1)

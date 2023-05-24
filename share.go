@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
 
@@ -50,20 +50,25 @@ func NewSnapshotter(root string, redisClient *redis.Client) (snapshots.Snapshott
 }
 
 func (o *Snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
+	key = parseKey(key)
 	return o.getInfo(ctx, key)
 }
 
 func (o *Snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (newInfo snapshots.Info, err error) {
-	result, err := o.client.Set(ctx, info.Name, info, 0).Result()
+	data, err := json.Marshal(info)
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+	result, err := o.client.Set(ctx, info.Name, data, 0).Result()
 	if err != nil {
 		return snapshots.Info{}, err
 	}
 
-	err = json.Unmarshal([]byte(result), &newInfo)
-	return newInfo, err
+	return unmarshalSnapInfo([]byte(result))
 }
 
 func (o *Snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Usage, err error) {
+	key = parseKey(key)
 	info, err := o.getInfo(ctx, key)
 	if err != nil {
 		return snapshots.Usage{}, err
@@ -93,7 +98,7 @@ func (o *Snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Us
 
 // Prepare creates a new snapshot with the given parent and writable layer.
 func (o *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	return o.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
+	return o.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
 }
 
 // View returns a readonly view of the given snapshot.
@@ -102,6 +107,7 @@ func (o *Snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 }
 
 func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
+	key = parseKey(key)
 	info, err := o.getInfo(ctx, key)
 	if err != nil {
 		return nil, err
@@ -129,6 +135,7 @@ func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 
 // Commit commits the given snapshot to the backend.
 func (o *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	key = parseKey(key)
 	info, err := o.getInfo(ctx, key)
 	if err != nil {
 		return err
@@ -143,7 +150,20 @@ func (o *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		return err
 	}
 
-	if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
+	info.Kind = snapshots.KindCommitted
+
+	data, err := json.Marshal(usage)
+	if err != nil {
+		return err
+	}
+	info.Labels[SnapUsage] = string(data)
+
+	data, err = json.Marshal(info)
+	if err != nil {
+		return err
+	}
+
+	if err := o.client.Set(ctx, parseKey(key), data, 0).Err(); err != nil {
 		return fmt.Errorf("failed to commit snapshot: %w", err)
 	}
 	return nil
@@ -162,8 +182,8 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 			return err
 		}
 
-		var info snapshots.Info
-		if err := json.Unmarshal([]byte(result), &info); err != nil {
+		info, err := unmarshalSnapInfo([]byte(result))
+		if err != nil {
 			return err
 		}
 
@@ -233,10 +253,6 @@ func (o *Snapshotter) Close() error {
 	return nil
 }
 
-func (o *Snapshotter) upperPath(id string) string {
-	return filepath.Join(o.root, "snapshots", id, "fs")
-}
-
 func (o *Snapshotter) getSnapshotDir(id string) string {
 	return filepath.Join(o.root, "snapshots", id)
 }
@@ -274,7 +290,9 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, fmt.Errorf("snapshot type %v invalid; only snapshots of type Active or View can be created: %w", kind, errdefs.ErrInvalidArgument)
 	}
 
-	var base snapshots.Info
+	base := snapshots.Info{
+		Labels: make(map[string]string),
+	}
 	for _, opt := range opts {
 		if err := opt(&base); err != nil {
 			return nil, err
@@ -283,35 +301,29 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 	var parentID string
 	if parent != "" {
-		parentInfo, err := o.getInfo(ctx, parent)
+		parentInfo, err := o.getInfo(ctx, parseKey(parent))
 		if err != nil {
 			return nil, err
 		}
 
-		if parentInfo.Kind != snapshots.KindCommitted {
-			return nil, fmt.Errorf("parent %q is not committed snapshot: %w", parent, errdefs.ErrInvalidArgument)
-		}
+		if !reflect.DeepEqual(parentInfo, snapshots.Info{}) {
+			if parentInfo.Kind != snapshots.KindCommitted {
+				return nil, fmt.Errorf("parent %q is not committed snapshot: %w", parent, errdefs.ErrInvalidArgument)
+			}
 
-		if id, ok := parentInfo.Labels[SnapID]; !ok {
-			return nil, errors.New(SnapID + " not found")
-		} else {
-			parentID = id
+			if id, ok := parentInfo.Labels[SnapID]; !ok {
+				return nil, errors.New(SnapID + " not found")
+			} else {
+				parentID = id
+			}
 		}
 	}
 
-	count, err := o.client.DBSize(ctx).Result()
-	if err != nil {
-		return nil, err
-	}
 	t := time.Now().UTC()
 
-	des, err := os.ReadDir(filepath.Join(o.root, "snapshots"))
-	if err != nil {
-		return nil, err
-	}
+	keyStrs := strings.Split(key, `/`)
 
-	// Id is key plus the number of current folders
-	id := strconv.Itoa(int(count) + len(des))
+	id := keyStrs[1]
 	base.Labels[SnapID] = id
 	si := snapshots.Info{
 		Parent:  parent,
@@ -321,26 +333,38 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		Updated: t,
 	}
 
-	if err := o.client.Set(ctx, key, si, 0).Err(); err != nil {
+	data, err := json.Marshal(si)
+	if err != nil {
 		return nil, err
 	}
 
-	if parentID != "" {
-		xattrErrorHandler := func(dst, src, xattrKey string, copyErr error) error {
-			// security.* xattr cannot be copied in most cases (moby/buildkit#1189)
-			log.G(ctx).WithError(copyErr).Debugf("failed to copy xattr %q", xattrKey)
-			return nil
-		}
+	if err := o.client.Set(ctx, parseKey(key), data, 0).Err(); err != nil {
+		return nil, err
+	}
 
-		copyDirOpts := []fs.CopyDirOpt{
-			fs.WithXAttrErrorHandler(xattrErrorHandler),
-		}
+	s := storage.Snapshot{
+		Kind: kind,
+		ID:   id,
+	}
 
-		parentPath := o.getSnapshotDir(parentID)
-		if err = fs.CopyDir(td, parentPath, copyDirOpts...); err != nil {
-			return nil, fmt.Errorf("copying of parent failed: %w", err)
-		}
+	if td != "" {
+		if parentID != "" {
+			xattrErrorHandler := func(dst, src, xattrKey string, copyErr error) error {
+				// security.* xattr cannot be copied in most cases (moby/buildkit#1189)
+				log.G(ctx).WithError(copyErr).Debugf("failed to copy xattr %q", xattrKey)
+				return nil
+			}
 
+			copyDirOpts := []fs.CopyDirOpt{
+				fs.WithXAttrErrorHandler(xattrErrorHandler),
+			}
+
+			parentPath := o.getSnapshotDir(parentID)
+			if err = fs.CopyDir(td, parentPath, copyDirOpts...); err != nil {
+				return nil, fmt.Errorf("copying of parent failed: %w", err)
+			}
+			s.ParentIDs = []string{parentID}
+		}
 		path = o.getSnapshotDir(id)
 		if err = os.Rename(td, path); err != nil {
 			return nil, fmt.Errorf("failed to rename: %w", err)
@@ -348,11 +372,21 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		td = ""
 	}
 
-	return o.mounts(storage.Snapshot{
-		Kind:      kind,
-		ID:        id,
-		ParentIDs: []string{parentID},
-	}), nil
+	return o.mounts(s), nil
+}
+
+func parseKey(key string) string {
+	ks := strings.Split(key, " ")
+	if len(ks) != 2 {
+		ks := strings.Split(key, "/")
+		if len(ks) != 3 {
+			return key
+		}
+		fmt.Println("--------", ks[2])
+		return ks[2]
+	}
+	fmt.Println("--------", ks[1])
+	return ks[1]
 }
 
 func (o *Snapshotter) mounts(s storage.Snapshot) []mount.Mount {
@@ -382,9 +416,21 @@ func (o *Snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 	}
 }
 
-func (o *Snapshotter) getInfo(ctx context.Context, key string) (info snapshots.Info, err error) {
-	err = o.client.Get(ctx, key).Scan(info)
-	return
+type MarshalInfo struct {
+	Kind    string            `json:"Kind"`
+	Name    string            `json:"Name"`
+	Labels  map[string]string `json:"Labels"`
+	Created string            `json:"Created"`
+	Updated string            `json:"Updated"`
+}
+
+func (o *Snapshotter) getInfo(ctx context.Context, key string) (snapshots.Info, error) {
+	result, err := o.client.Get(ctx, key).Result()
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+
+	return unmarshalSnapInfo([]byte(result))
 }
 
 func adaptSnapshot(info snapshots.Info) filters.Adaptor {
@@ -418,4 +464,28 @@ func adaptSnapshot(info snapshots.Info) filters.Adaptor {
 
 		return "", false
 	})
+}
+
+func unmarshalSnapInfo(data []byte) (snapshots.Info, error) {
+	var mi MarshalInfo
+	if err := json.Unmarshal(data, &mi); err != nil {
+		return snapshots.Info{}, err
+	}
+	var info snapshots.Info
+	info.Kind = snapshots.ParseKind(mi.Kind)
+	info.Name = mi.Name
+	info.Labels = mi.Labels
+
+	t, err := time.Parse(time.RFC3339Nano, mi.Created)
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+	info.Created = t
+
+	t, err = time.Parse(time.RFC3339Nano, mi.Created)
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+	info.Updated = t
+	return info, nil
 }
